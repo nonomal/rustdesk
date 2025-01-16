@@ -1,9 +1,11 @@
 use std::time::Duration;
 
+use scrap::{Frame, TraitPixelBuffer};
+
 extern crate scrap;
 
 fn main() {
-    use scrap::{Capturer, Display};
+    use scrap::{Capturer, Display, TraitCapturer};
     use std::io::ErrorKind::WouldBlock;
     use std::io::Write;
     use std::process::{Command, Stdio};
@@ -27,16 +29,19 @@ fn main() {
         .spawn()
         .expect("This example requires ffplay.");
 
-    let mut capturer = Capturer::new(d, false).unwrap();
+    let mut capturer = Capturer::new(d).unwrap();
     let mut out = child.stdin.unwrap();
 
     loop {
         match capturer.frame(Duration::from_millis(0)) {
             Ok(frame) => {
                 // Write the frame, removing end-of-row padding.
-                let stride = frame.len() / h;
+                let Frame::PixelBuffer(frame) = frame else {
+                    return;
+                };
+                let stride = frame.stride()[0];
                 let rowlen = 4 * w;
-                for row in frame.chunks(stride) {
+                for row in frame.data().chunks(stride) {
                     let row = &row[..rowlen];
                     out.write_all(row).unwrap();
                 }

@@ -1,13 +1,28 @@
 import 'dart:async';
 import 'dart:convert';
+
 import 'package:flutter/material.dart';
-import 'package:wakelock/wakelock.dart';
+import 'package:flutter_hbb/consts.dart';
+import 'package:flutter_hbb/main.dart';
+import 'package:flutter_hbb/mobile/pages/settings_page.dart';
+import 'package:flutter_hbb/models/chat_model.dart';
+import 'package:flutter_hbb/models/platform_model.dart';
+import 'package:get/get.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
+import 'package:window_manager/window_manager.dart';
+
 import '../common.dart';
-import '../pages/server_page.dart';
+import '../common/formatter/id_formatter.dart';
+import '../desktop/pages/server_page.dart' as desktop;
+import '../desktop/widgets/tabbar_widget.dart';
+import '../mobile/pages/server_page.dart';
 import 'model.dart';
 
-const loginDialogTag = "LOGIN";
-final _emptyIdShow = translate("Generating ...");
+const kLoginDialogTag = "LOGIN";
+
+const kUseTemporaryPassword = "use-temporary-password";
+const kUsePermanentPassword = "use-permanent-password";
+const kUseBothPasswords = "use-both-passwords";
 
 class ServerModel with ChangeNotifier {
   bool _isStart = false; // Android MainService status
@@ -15,12 +30,25 @@ class ServerModel with ChangeNotifier {
   bool _inputOk = false;
   bool _audioOk = false;
   bool _fileOk = false;
+  bool _clipboardOk = false;
+  bool _showElevation = false;
+  bool hideCm = false;
   int _connectStatus = 0; // Rendezvous Server status
+  String _verificationMethod = "";
+  String _temporaryPasswordLength = "";
+  String _approveMode = "";
+  int _zeroClientLengthCounter = 0;
 
-  final _serverId = TextEditingController(text: _emptyIdShow);
-  final _serverPasswd = TextEditingController(text: "");
+  late String _emptyIdShow;
+  late final IDTextEditingController _serverId;
+  final _serverPasswd =
+      TextEditingController(text: translate("Generating ..."));
 
-  Map<int, Client> _clients = {};
+  final tabController = DesktopTabController(tabType: DesktopTabType.cm);
+
+  final List<Client> _clients = [];
+
+  Timer? cmHiddenTimer;
 
   bool get isStart => _isStart;
 
@@ -32,239 +60,422 @@ class ServerModel with ChangeNotifier {
 
   bool get fileOk => _fileOk;
 
+  bool get clipboardOk => _clipboardOk;
+
+  bool get showElevation => _showElevation;
+
   int get connectStatus => _connectStatus;
+
+  String get verificationMethod {
+    final index = [
+      kUseTemporaryPassword,
+      kUsePermanentPassword,
+      kUseBothPasswords
+    ].indexOf(_verificationMethod);
+    if (index < 0) {
+      return kUseBothPasswords;
+    }
+    return _verificationMethod;
+  }
+
+  String get approveMode => _approveMode;
+
+  setVerificationMethod(String method) async {
+    await bind.mainSetOption(key: kOptionVerificationMethod, value: method);
+    /*
+    if (method != kUsePermanentPassword) {
+      await bind.mainSetOption(
+          key: 'allow-hide-cm', value: bool2option('allow-hide-cm', false));
+    }
+    */
+  }
+
+  String get temporaryPasswordLength {
+    final lengthIndex = ["6", "8", "10"].indexOf(_temporaryPasswordLength);
+    if (lengthIndex < 0) {
+      return "6";
+    }
+    return _temporaryPasswordLength;
+  }
+
+  setTemporaryPasswordLength(String length) async {
+    await bind.mainSetOption(key: "temporary-password-length", value: length);
+  }
+
+  setApproveMode(String mode) async {
+    await bind.mainSetOption(key: kOptionApproveMode, value: mode);
+    /*
+    if (mode != 'password') {
+      await bind.mainSetOption(
+          key: 'allow-hide-cm', value: bool2option('allow-hide-cm', false));
+    }
+    */
+  }
 
   TextEditingController get serverId => _serverId;
 
   TextEditingController get serverPasswd => _serverPasswd;
 
-  Map<int, Client> get clients => _clients;
+  List<Client> get clients => _clients;
 
   final controller = ScrollController();
 
-  ServerModel() {
-    () async {
-      /**
-       * 1. check android permission
-       * 2. check config
-       * audio true by default (if permission on) (false default < Android 10)
-       * file true by default (if permission on)
-       */
-      await Future.delayed(Duration(seconds: 1));
+  WeakReference<FFI> parent;
 
-      // audio
-      if (androidVersion < 30 || !await PermissionManager.check("audio")) {
-        _audioOk = false;
-        FFI.setByName(
-            'option',
-            jsonEncode(Map()
-              ..["name"] = "enable-audio"
-              ..["value"] = "N"));
-      } else {
-        final audioOption = FFI.getByName('option', 'enable-audio');
-        _audioOk = audioOption.isEmpty;
-      }
+  ServerModel(this.parent) {
+    _emptyIdShow = translate("Generating ...");
+    _serverId = IDTextEditingController(text: _emptyIdShow);
 
-      // file
-      if (!await PermissionManager.check("file")) {
-        _fileOk = false;
-        FFI.setByName(
-            'option',
-            jsonEncode(Map()
-              ..["name"] = "enable-file-transfer"
-              ..["value"] = "N"));
-      } else {
-        final fileOption = FFI.getByName('option', 'enable-file-transfer');
-        _fileOk = fileOption.isEmpty;
-      }
+    /*
+    // initital _hideCm at startup
+    final verificationMethod =
+        bind.mainGetOptionSync(key: kOptionVerificationMethod);
+    final approveMode = bind.mainGetOptionSync(key: kOptionApproveMode);
+    _hideCm = option2bool(
+        'allow-hide-cm', bind.mainGetOptionSync(key: 'allow-hide-cm'));
+    if (!(approveMode == 'password' &&
+        verificationMethod == kUsePermanentPassword)) {
+      _hideCm = false;
+    }
+    */
 
-      notifyListeners();
-    }();
-
-    Timer.periodic(Duration(seconds: 1), (timer) {
-      var status = int.tryParse(FFI.getByName('connect_statue')) ?? 0;
-      if (status > 0) {
-        status = 1;
-      }
-      if (status != _connectStatus) {
-        _connectStatus = status;
+    timerCallback() async {
+      final connectionStatus =
+          jsonDecode(await bind.mainGetConnectStatus()) as Map<String, dynamic>;
+      final statusNum = connectionStatus['status_num'] as int;
+      if (statusNum != _connectStatus) {
+        _connectStatus = statusNum;
         notifyListeners();
       }
-      final res =
-          FFI.getByName('check_clients_length', _clients.length.toString());
-      if (res.isNotEmpty) {
-        debugPrint("clients not match!");
-        updateClientState(res);
+
+      if (desktopType == DesktopType.cm) {
+        final res = await bind.cmCheckClientsLength(length: _clients.length);
+        if (res != null) {
+          debugPrint("clients not match!");
+          updateClientState(res);
+        } else {
+          if (_clients.isEmpty) {
+            hideCmWindow();
+            if (_zeroClientLengthCounter++ == 12) {
+              // 6 second
+              windowManager.close();
+            }
+          } else {
+            _zeroClientLengthCounter = 0;
+            if (!hideCm) showCmWindow();
+          }
+        }
       }
-    });
+
+      updatePasswordModel();
+    }
+
+    if (!isTest) {
+      Future.delayed(Duration.zero, () async {
+        if (await bind.optionSynced()) {
+          await timerCallback();
+        }
+      });
+      Timer.periodic(Duration(milliseconds: 500), (timer) async {
+        await timerCallback();
+      });
+    }
+
+    // Initial keyboard status is off on mobile
+    if (isMobile) {
+      bind.mainSetOption(key: kOptionEnableKeyboard, value: 'N');
+    }
+  }
+
+  /// 1. check android permission
+  /// 2. check config
+  /// audio true by default (if permission on) (false default < Android 10)
+  /// file true by default (if permission on)
+  checkAndroidPermission() async {
+    // audio
+    if (androidVersion < 30 ||
+        !await AndroidPermissionManager.check(kRecordAudio)) {
+      _audioOk = false;
+      bind.mainSetOption(key: kOptionEnableAudio, value: "N");
+    } else {
+      final audioOption = await bind.mainGetOption(key: kOptionEnableAudio);
+      _audioOk = audioOption != 'N';
+    }
+
+    // file
+    if (!await AndroidPermissionManager.check(kManageExternalStorage)) {
+      _fileOk = false;
+      bind.mainSetOption(key: kOptionEnableFileTransfer, value: "N");
+    } else {
+      final fileOption =
+          await bind.mainGetOption(key: kOptionEnableFileTransfer);
+      _fileOk = fileOption != 'N';
+    }
+
+    // clipboard
+    final clipOption = await bind.mainGetOption(key: kOptionEnableClipboard);
+    _clipboardOk = clipOption != 'N';
+
+    notifyListeners();
+  }
+
+  updatePasswordModel() async {
+    var update = false;
+    final temporaryPassword = await bind.mainGetTemporaryPassword();
+    final verificationMethod =
+        await bind.mainGetOption(key: kOptionVerificationMethod);
+    final temporaryPasswordLength =
+        await bind.mainGetOption(key: "temporary-password-length");
+    final approveMode = await bind.mainGetOption(key: kOptionApproveMode);
+    /*
+    var hideCm = option2bool(
+        'allow-hide-cm', await bind.mainGetOption(key: 'allow-hide-cm'));
+    if (!(approveMode == 'password' &&
+        verificationMethod == kUsePermanentPassword)) {
+      hideCm = false;
+    }
+    */
+    if (_approveMode != approveMode) {
+      _approveMode = approveMode;
+      update = true;
+    }
+    var stopped = await mainGetBoolOption(kOptionStopService);
+    final oldPwdText = _serverPasswd.text;
+    if (stopped ||
+        verificationMethod == kUsePermanentPassword ||
+        _approveMode == 'click') {
+      _serverPasswd.text = '-';
+    } else {
+      if (_serverPasswd.text != temporaryPassword &&
+          temporaryPassword.isNotEmpty) {
+        _serverPasswd.text = temporaryPassword;
+      }
+    }
+    if (oldPwdText != _serverPasswd.text) {
+      update = true;
+    }
+    if (_verificationMethod != verificationMethod) {
+      _verificationMethod = verificationMethod;
+      update = true;
+    }
+    if (_temporaryPasswordLength != temporaryPasswordLength) {
+      if (_temporaryPasswordLength.isNotEmpty) {
+        bind.mainUpdateTemporaryPassword();
+      }
+      _temporaryPasswordLength = temporaryPasswordLength;
+      update = true;
+    }
+    /*
+    if (_hideCm != hideCm) {
+      _hideCm = hideCm;
+      if (desktopType == DesktopType.cm) {
+        if (hideCm) {
+          await hideCmWindow();
+        } else {
+          await showCmWindow();
+        }
+      }
+      update = true;
+    }
+    */
+    if (update) {
+      notifyListeners();
+    }
   }
 
   toggleAudio() async {
-    if (!_audioOk && !await PermissionManager.check("audio")) {
-      final res = await PermissionManager.request("audio");
+    if (clients.isNotEmpty) {
+      await showClientsMayNotBeChangedAlert(parent.target);
+    }
+    if (!_audioOk && !await AndroidPermissionManager.check(kRecordAudio)) {
+      final res = await AndroidPermissionManager.request(kRecordAudio);
       if (!res) {
-        // TODO handle fail
+        showToast(translate('Failed'));
         return;
       }
     }
 
     _audioOk = !_audioOk;
-    Map<String, String> res = Map()
-      ..["name"] = "enable-audio"
-      ..["value"] = _audioOk ? '' : 'N';
-    FFI.setByName('option', jsonEncode(res));
+    bind.mainSetOption(
+        key: kOptionEnableAudio, value: _audioOk ? defaultOptionYes : 'N');
     notifyListeners();
   }
 
   toggleFile() async {
-    if (!_fileOk && !await PermissionManager.check("file")) {
-      final res = await PermissionManager.request("file");
+    if (clients.isNotEmpty) {
+      await showClientsMayNotBeChangedAlert(parent.target);
+    }
+    if (!_fileOk &&
+        !await AndroidPermissionManager.check(kManageExternalStorage)) {
+      final res =
+          await AndroidPermissionManager.request(kManageExternalStorage);
       if (!res) {
-        // TODO handle fail
+        showToast(translate('Failed'));
         return;
       }
     }
 
     _fileOk = !_fileOk;
-    Map<String, String> res = Map()
-      ..["name"] = "enable-file-transfer"
-      ..["value"] = _fileOk ? '' : 'N';
-    FFI.setByName('option', jsonEncode(res));
+    bind.mainSetOption(
+        key: kOptionEnableFileTransfer,
+        value: _fileOk ? defaultOptionYes : 'N');
     notifyListeners();
   }
 
-  toggleInput() {
+  toggleClipboard() async {
+    _clipboardOk = !clipboardOk;
+    bind.mainSetOption(
+        key: kOptionEnableClipboard,
+        value: clipboardOk ? defaultOptionYes : 'N');
+    notifyListeners();
+  }
+
+  toggleInput() async {
+    if (clients.isNotEmpty) {
+      await showClientsMayNotBeChangedAlert(parent.target);
+    }
     if (_inputOk) {
-      FFI.invokeMethod("stop_input");
+      parent.target?.invokeMethod("stop_input");
+      bind.mainSetOption(key: kOptionEnableKeyboard, value: 'N');
     } else {
-      showInputWarnAlert();
+      if (parent.target != null) {
+        /// the result of toggle-on depends on user actions in the settings page.
+        /// handle result, see [ServerModel.changeStatue]
+        showInputWarnAlert(parent.target!);
+      }
     }
   }
 
+  Future<bool> checkRequestNotificationPermission() async {
+    debugPrint("androidVersion $androidVersion");
+    if (androidVersion < 33) {
+      return true;
+    }
+    if (await AndroidPermissionManager.check(kAndroid13Notification)) {
+      debugPrint("notification permission already granted");
+      return true;
+    }
+    var res = await AndroidPermissionManager.request(kAndroid13Notification);
+    debugPrint("notification permission request result: $res");
+    return res;
+  }
+
+  Future<bool> checkFloatingWindowPermission() async {
+    debugPrint("androidVersion $androidVersion");
+    if (androidVersion < 23) {
+      return false;
+    }
+    if (await AndroidPermissionManager.check(kSystemAlertWindow)) {
+      debugPrint("alert window permission already granted");
+      return true;
+    }
+    var res = await AndroidPermissionManager.request(kSystemAlertWindow);
+    debugPrint("alert window permission request result: $res");
+    return res;
+  }
+
+  /// Toggle the screen sharing service.
   toggleService() async {
     if (_isStart) {
-      final res =
-          await DialogManager.show<bool>((setState, close) => CustomAlertDialog(
-                title: Row(children: [
-                  Icon(Icons.warning_amber_sharp,
-                      color: Colors.redAccent, size: 28),
-                  SizedBox(width: 10),
-                  Text(translate("Warning")),
-                ]),
-                content: Text(translate("android_stop_service_tip")),
-                actions: [
-                  TextButton(
-                      onPressed: () => close(),
-                      child: Text(translate("Cancel"))),
-                  ElevatedButton(
-                      onPressed: () => close(true),
-                      child: Text(translate("OK"))),
-                ],
-              ));
+      final res = await parent.target?.dialogManager
+          .show<bool>((setState, close, context) {
+        submit() => close(true);
+        return CustomAlertDialog(
+          title: Row(children: [
+            const Icon(Icons.warning_amber_sharp,
+                color: Colors.redAccent, size: 28),
+            const SizedBox(width: 10),
+            Text(translate("Warning")),
+          ]),
+          content: Text(translate("android_stop_service_tip")),
+          actions: [
+            TextButton(onPressed: close, child: Text(translate("Cancel"))),
+            TextButton(onPressed: submit, child: Text(translate("OK"))),
+          ],
+          onSubmit: submit,
+          onCancel: close,
+        );
+      });
       if (res == true) {
         stopService();
       }
     } else {
-      final res =
-          await DialogManager.show<bool>((setState, close) => CustomAlertDialog(
-                title: Row(children: [
-                  Icon(Icons.warning_amber_sharp,
-                      color: Colors.redAccent, size: 28),
-                  SizedBox(width: 10),
-                  Text(translate("Warning")),
-                ]),
-                content: Text(translate("android_service_will_start_tip")),
-                actions: [
-                  TextButton(
-                      onPressed: () => close(),
-                      child: Text(translate("Cancel"))),
-                  ElevatedButton(
-                      onPressed: () => close(true),
-                      child: Text(translate("OK"))),
-                ],
-              ));
+      await checkRequestNotificationPermission();
+      if (bind.mainGetLocalOption(key: kOptionDisableFloatingWindow) != 'Y') {
+        await checkFloatingWindowPermission();
+      }
+      if (!await AndroidPermissionManager.check(kManageExternalStorage)) {
+        await AndroidPermissionManager.request(kManageExternalStorage);
+      }
+      final res = await parent.target?.dialogManager
+          .show<bool>((setState, close, context) {
+        submit() => close(true);
+        return CustomAlertDialog(
+          title: Row(children: [
+            const Icon(Icons.warning_amber_sharp,
+                color: Colors.redAccent, size: 28),
+            const SizedBox(width: 10),
+            Text(translate("Warning")),
+          ]),
+          content: Text(translate("android_service_will_start_tip")),
+          actions: [
+            dialogButton("Cancel", onPressed: close, isOutline: true),
+            dialogButton("OK", onPressed: submit),
+          ],
+          onSubmit: submit,
+          onCancel: close,
+        );
+      });
       if (res == true) {
         startService();
       }
     }
   }
 
-  Future<Null> startService() async {
+  /// Start the screen sharing service.
+  Future<void> startService() async {
     _isStart = true;
     notifyListeners();
-    FFI.ffiModel.updateEventListener("");
-    await FFI.invokeMethod("init_service");
-    FFI.setByName("start_service");
-    getIDPasswd();
+    parent.target?.ffiModel.updateEventListener(parent.target!.sessionId, "");
+    await parent.target?.invokeMethod("init_service");
+    // ugly is here, because for desktop, below is useless
+    await bind.mainStartService();
     updateClientState();
-    Wakelock.enable();
+    if (isAndroid) {
+      androidUpdatekeepScreenOn();
+    }
   }
 
-  Future<Null> stopService() async {
+  /// Stop the screen sharing service.
+  Future<void> stopService() async {
     _isStart = false;
-    FFI.serverModel.closeAll();
-    await FFI.invokeMethod("stop_service");
-    FFI.setByName("stop_service");
+    closeAll();
+    await parent.target?.invokeMethod("stop_service");
+    await bind.mainStopService();
     notifyListeners();
-    Wakelock.disable();
+    if (!isLinux) {
+      // current linux is not supported
+      WakelockPlus.disable();
+    }
   }
 
-  Future<Null> initInput() async {
-    await FFI.invokeMethod("init_input");
-  }
-
-  Future<bool> updatePassword(String pw) async {
-    final oldPasswd = _serverPasswd.text;
-    FFI.setByName("update_password", pw);
+  Future<bool> setPermanentPassword(String newPW) async {
+    await bind.mainSetPermanentPassword(password: newPW);
     await Future.delayed(Duration(milliseconds: 500));
-    await getIDPasswd(force: true);
-
-    // check result
-    if (pw == "") {
-      if (_serverPasswd.text.isNotEmpty && _serverPasswd.text != oldPasswd) {
-        return true;
-      } else {
-        return false;
-      }
+    final pw = await bind.mainGetPermanentPassword();
+    if (newPW == pw) {
+      return true;
     } else {
-      if (_serverPasswd.text == pw) {
-        return true;
-      } else {
-        return false;
-      }
+      return false;
     }
   }
 
-  getIDPasswd({bool force = false}) async {
-    if (!force && _serverId.text != _emptyIdShow && _serverPasswd.text != "") {
-      return;
+  fetchID() async {
+    final id = await bind.mainGetMyId();
+    if (id != _serverId.id) {
+      _serverId.id = id;
+      notifyListeners();
     }
-    var count = 0;
-    const maxCount = 10;
-    while (count < maxCount) {
-      await Future.delayed(Duration(seconds: 1));
-      final id = FFI.getByName("server_id");
-      final passwd = FFI.getByName("server_password");
-      if (id.isEmpty) {
-        continue;
-      } else {
-        _serverId.text = id;
-      }
-
-      if (passwd.isEmpty) {
-        continue;
-      } else {
-        _serverPasswd.text = passwd;
-      }
-
-      debugPrint(
-          "fetch id & passwd again at $count:id:${_serverId.text},passwd:${_serverPasswd.text}");
-      count++;
-      if (_serverId.text != _emptyIdShow && _serverPasswd.text.isNotEmpty) {
-        break;
-      }
-    }
-    notifyListeners();
   }
 
   changeStatue(String name, bool value) {
@@ -278,10 +489,9 @@ class ServerModel with ChangeNotifier {
         break;
       case "input":
         if (_inputOk != value) {
-          Map<String, String> res = Map()
-            ..["name"] = "enable-keyboard"
-            ..["value"] = value ? '' : 'N';
-          FFI.setByName('option', jsonEncode(res));
+          bind.mainSetOption(
+              key: kOptionEnableKeyboard,
+              value: value ? defaultOptionYes : 'N');
         }
         _inputOk = value;
         break;
@@ -291,82 +501,174 @@ class ServerModel with ChangeNotifier {
     notifyListeners();
   }
 
-  updateClientState([String? json]) {
-    var res = json ?? FFI.getByName("clients_state");
+  // force
+  updateClientState([String? json]) async {
+    if (isTest) return;
+    var res = await bind.cmGetClientsState();
+    List<dynamic> clientsJson;
     try {
-      final List clientsJson = jsonDecode(res);
-      for (var clientJson in clientsJson) {
-        final client = Client.fromJson(clientJson);
-        _clients[client.id] = client;
-      }
-      notifyListeners();
+      clientsJson = jsonDecode(res);
     } catch (e) {
-      debugPrint("Failed to updateClientState:$e");
+      debugPrint("Failed to decode clientsJson: '$res', error $e");
+      return;
+    }
+
+    final oldClientLenght = _clients.length;
+    _clients.clear();
+    tabController.state.value.tabs.clear();
+
+    for (var clientJson in clientsJson) {
+      try {
+        final client = Client.fromJson(clientJson);
+        _clients.add(client);
+        _addTab(client);
+      } catch (e) {
+        debugPrint("Failed to decode clientJson '$clientJson', error $e");
+      }
+    }
+    if (desktopType == DesktopType.cm) {
+      if (_clients.isEmpty) {
+        hideCmWindow();
+      } else if (!hideCm) {
+        showCmWindow();
+      }
+    }
+    if (_clients.length != oldClientLenght) {
+      notifyListeners();
+      if (isAndroid) androidUpdatekeepScreenOn();
     }
   }
 
-  void loginRequest(Map<String, dynamic> evt) {
+  void addConnection(Map<String, dynamic> evt) {
     try {
       final client = Client.fromJson(jsonDecode(evt["client"]));
-      if (_clients.containsKey(client.id)) {
-        return;
+      if (client.authorized) {
+        parent.target?.dialogManager.dismissByTag(getLoginDialogTag(client.id));
+        final index = _clients.indexWhere((c) => c.id == client.id);
+        if (index < 0) {
+          _clients.add(client);
+        } else {
+          _clients[index].authorized = true;
+        }
+      } else {
+        if (_clients.any((c) => c.id == client.id)) {
+          return;
+        }
+        _clients.add(client);
       }
-      _clients[client.id] = client;
+      _addTab(client);
+      // remove disconnected
+      final index_disconnected = _clients
+          .indexWhere((c) => c.disconnected && c.peerId == client.peerId);
+      if (index_disconnected >= 0) {
+        _clients.removeAt(index_disconnected);
+        tabController.remove(index_disconnected);
+      }
+      if (desktopType == DesktopType.cm && !hideCm) {
+        showCmWindow();
+      }
       scrollToBottom();
       notifyListeners();
-      showLoginDialog(client);
+      if (isAndroid && !client.authorized) showLoginDialog(client);
+      if (isAndroid) androidUpdatekeepScreenOn();
     } catch (e) {
       debugPrint("Failed to call loginRequest,error:$e");
     }
   }
 
+  void _addTab(Client client) {
+    tabController.add(TabInfo(
+        key: client.id.toString(),
+        label: client.name,
+        closable: false,
+        onTap: () {},
+        page: desktop.buildConnectionCard(client)));
+    Future.delayed(Duration.zero, () async {
+      if (!hideCm) windowOnTop(null);
+    });
+    // Only do the hidden task when on Desktop.
+    if (client.authorized && isDesktop) {
+      cmHiddenTimer = Timer(const Duration(seconds: 3), () {
+        if (!hideCm) windowManager.minimize();
+        cmHiddenTimer = null;
+      });
+    }
+    parent.target?.chatModel
+        .updateConnIdOfKey(MessageKey(client.peerId, client.id));
+  }
+
   void showLoginDialog(Client client) {
-    DialogManager.show(
-        (setState, close) => CustomAlertDialog(
-              title: Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    Text(translate(client.isFileTransfer
-                        ? "File Connection"
-                        : "Screen Connection")),
-                    IconButton(
-                        onPressed: () {
-                          close();
-                        },
-                        icon: Icon(Icons.close))
-                  ]),
-              content: Column(
-                mainAxisSize: MainAxisSize.min,
-                mainAxisAlignment: MainAxisAlignment.center,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(translate("Do you accept?")),
-                  clientInfo(client),
-                  Text(
-                    translate("android_new_connection_tip"),
-                    style: TextStyle(color: Colors.black54),
-                  ),
-                ],
-              ),
-              actions: [
-                TextButton(
-                    child: Text(translate("Dismiss")),
-                    onPressed: () {
-                      sendLoginResponse(client, false);
-                      close();
-                    }),
-                ElevatedButton(
-                    child: Text(translate("Accept")),
-                    onPressed: () {
-                      sendLoginResponse(client, true);
-                      close();
-                    }),
-              ],
+    showClientDialog(
+      client,
+      client.isFileTransfer ? "File Connection" : "Screen Connection",
+      'Do you accept?',
+      'android_new_connection_tip',
+      () => sendLoginResponse(client, false),
+      () => sendLoginResponse(client, true),
+    );
+  }
+
+  handleVoiceCall(Client client, bool accept) {
+    parent.target?.invokeMethod("cancel_notification", client.id);
+    bind.cmHandleIncomingVoiceCall(id: client.id, accept: accept);
+  }
+
+  showVoiceCallDialog(Client client) {
+    showClientDialog(
+      client,
+      'Voice call',
+      'Do you accept?',
+      'android_new_voice_call_tip',
+      () => handleVoiceCall(client, false),
+      () => handleVoiceCall(client, true),
+    );
+  }
+
+  showClientDialog(Client client, String title, String contentTitle,
+      String content, VoidCallback onCancel, VoidCallback onSubmit) {
+    parent.target?.dialogManager.show((setState, close, context) {
+      cancel() {
+        onCancel();
+        close();
+      }
+
+      submit() {
+        onSubmit();
+        close();
+      }
+
+      return CustomAlertDialog(
+        title:
+            Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+          Text(translate(title)),
+          IconButton(onPressed: close, icon: const Icon(Icons.close))
+        ]),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          mainAxisAlignment: MainAxisAlignment.center,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(translate(contentTitle)),
+            ClientInfo(client),
+            Text(
+              translate(content),
+              style: Theme.of(globalKey.currentContext!).textTheme.bodyMedium,
             ),
-        tag: getLoginDialogTag(client.id));
+          ],
+        ),
+        actions: [
+          dialogButton("Dismiss", onPressed: cancel, isOutline: true),
+          if (approveMode != 'password')
+            dialogButton("Accept", onPressed: submit),
+        ],
+        onSubmit: submit,
+        onCancel: cancel,
+      );
+    }, tag: getLoginDialogTag(client.id));
   }
 
   scrollToBottom() {
+    if (isDesktop) return;
     Future.delayed(Duration(milliseconds: 200), () {
       controller.animateTo(controller.position.maxScrollExtent,
           duration: Duration(milliseconds: 200),
@@ -374,118 +676,247 @@ class ServerModel with ChangeNotifier {
     });
   }
 
-  void sendLoginResponse(Client client, bool res) {
-    final Map<String, dynamic> response = Map();
-    response["id"] = client.id;
-    response["res"] = res;
+  void sendLoginResponse(Client client, bool res) async {
     if (res) {
-      FFI.setByName("login_res", jsonEncode(response));
+      bind.cmLoginRes(connId: client.id, res: res);
       if (!client.isFileTransfer) {
-        FFI.invokeMethod("start_capture");
+        parent.target?.invokeMethod("start_capture");
       }
-      FFI.invokeMethod("cancel_notification", client.id);
-      _clients[client.id]?.authorized = true;
+      parent.target?.invokeMethod("cancel_notification", client.id);
+      client.authorized = true;
       notifyListeners();
     } else {
-      FFI.setByName("login_res", jsonEncode(response));
-      FFI.invokeMethod("cancel_notification", client.id);
-      _clients.remove(client.id);
+      bind.cmLoginRes(connId: client.id, res: res);
+      parent.target?.invokeMethod("cancel_notification", client.id);
+      final index = _clients.indexOf(client);
+      tabController.remove(index);
+      _clients.remove(client);
+      if (isAndroid) androidUpdatekeepScreenOn();
     }
-  }
-
-  void onClientAuthorized(Map<String, dynamic> evt) {
-    try {
-      final client = Client.fromJson(jsonDecode(evt['client']));
-      DialogManager.dismissByTag(getLoginDialogTag(client.id));
-      _clients[client.id] = client;
-      scrollToBottom();
-      notifyListeners();
-    } catch (e) {}
   }
 
   void onClientRemove(Map<String, dynamic> evt) {
     try {
       final id = int.parse(evt['id'] as String);
-      if (_clients.containsKey(id)) {
-        _clients.remove(id);
-        DialogManager.dismissByTag(getLoginDialogTag(id));
-        FFI.invokeMethod("cancel_notification", id);
+      final close = (evt['close'] as String) == 'true';
+      if (_clients.any((c) => c.id == id)) {
+        final index = _clients.indexWhere((client) => client.id == id);
+        if (index >= 0) {
+          if (close) {
+            _clients.removeAt(index);
+            tabController.remove(index);
+          } else {
+            _clients[index].disconnected = true;
+          }
+        }
+        parent.target?.dialogManager.dismissByTag(getLoginDialogTag(id));
+        parent.target?.invokeMethod("cancel_notification", id);
       }
+      if (desktopType == DesktopType.cm && _clients.isEmpty) {
+        hideCmWindow();
+      }
+      if (isAndroid) androidUpdatekeepScreenOn();
       notifyListeners();
     } catch (e) {
       debugPrint("onClientRemove failed,error:$e");
     }
   }
 
-  closeAll() {
-    _clients.forEach((id, client) {
-      FFI.setByName("close_conn", id.toString());
-    });
+  Future<void> closeAll() async {
+    await Future.wait(
+        _clients.map((client) => bind.cmCloseConnection(connId: client.id)));
     _clients.clear();
+    tabController.state.value.tabs.clear();
+    if (isAndroid) androidUpdatekeepScreenOn();
   }
+
+  void jumpTo(int id) {
+    final index = _clients.indexWhere((client) => client.id == id);
+    tabController.jumpTo(index);
+  }
+
+  void setShowElevation(bool show) {
+    if (_showElevation != show) {
+      _showElevation = show;
+      notifyListeners();
+    }
+  }
+
+  void updateVoiceCallState(Map<String, dynamic> evt) {
+    try {
+      final client = Client.fromJson(jsonDecode(evt["client"]));
+      final index = _clients.indexWhere((element) => element.id == client.id);
+      if (index != -1) {
+        _clients[index].inVoiceCall = client.inVoiceCall;
+        _clients[index].incomingVoiceCall = client.incomingVoiceCall;
+        if (client.incomingVoiceCall) {
+          if (isAndroid) {
+            showVoiceCallDialog(client);
+          } else {
+            // Has incoming phone call, let's set the window on top.
+            Future.delayed(Duration.zero, () {
+              windowOnTop(null);
+            });
+          }
+        }
+        notifyListeners();
+      }
+    } catch (e) {
+      debugPrint("updateVoiceCallState failed: $e");
+    }
+  }
+
+  void androidUpdatekeepScreenOn() async {
+    if (!isAndroid) return;
+    var floatingWindowDisabled =
+        bind.mainGetLocalOption(key: kOptionDisableFloatingWindow) == "Y" ||
+            !await AndroidPermissionManager.check(kSystemAlertWindow);
+    final keepScreenOn = floatingWindowDisabled
+        ? KeepScreenOn.never
+        : optionToKeepScreenOn(
+            bind.mainGetLocalOption(key: kOptionKeepScreenOn));
+    final on = ((keepScreenOn == KeepScreenOn.serviceOn) && _isStart) ||
+        (keepScreenOn == KeepScreenOn.duringControlled &&
+            _clients.map((e) => !e.disconnected).isNotEmpty);
+    if (on != await WakelockPlus.enabled) {
+      if (on) {
+        WakelockPlus.enable();
+      } else {
+        WakelockPlus.disable();
+      }
+    }
+  }
+}
+
+enum ClientType {
+  remote,
+  file,
+  portForward,
 }
 
 class Client {
   int id = 0; // client connections inner count id
   bool authorized = false;
   bool isFileTransfer = false;
+  String portForward = "";
   String name = "";
   String peerId = ""; // peer user's id,show at app
   bool keyboard = false;
   bool clipboard = false;
   bool audio = false;
+  bool file = false;
+  bool restart = false;
+  bool recording = false;
+  bool blockInput = false;
+  bool disconnected = false;
+  bool fromSwitch = false;
+  bool inVoiceCall = false;
+  bool incomingVoiceCall = false;
 
-  Client(this.authorized, this.isFileTransfer, this.name, this.peerId,
+  RxInt unreadChatMessageCount = 0.obs;
+
+  Client(this.id, this.authorized, this.isFileTransfer, this.name, this.peerId,
       this.keyboard, this.clipboard, this.audio);
 
   Client.fromJson(Map<String, dynamic> json) {
     id = json['id'];
     authorized = json['authorized'];
     isFileTransfer = json['is_file_transfer'];
+    portForward = json['port_forward'];
     name = json['name'];
     peerId = json['peer_id'];
     keyboard = json['keyboard'];
     clipboard = json['clipboard'];
     audio = json['audio'];
+    file = json['file'];
+    restart = json['restart'];
+    recording = json['recording'];
+    blockInput = json['block_input'];
+    disconnected = json['disconnected'];
+    fromSwitch = json['from_switch'];
+    inVoiceCall = json['in_voice_call'];
+    incomingVoiceCall = json['incoming_voice_call'];
   }
 
   Map<String, dynamic> toJson() {
-    final Map<String, dynamic> data = new Map<String, dynamic>();
-    data['id'] = this.id;
-    data['is_start'] = this.authorized;
-    data['is_file_transfer'] = this.isFileTransfer;
-    data['name'] = this.name;
-    data['peer_id'] = this.peerId;
-    data['keyboard'] = this.keyboard;
-    data['clipboard'] = this.clipboard;
-    data['audio'] = this.audio;
+    final Map<String, dynamic> data = <String, dynamic>{};
+    data['id'] = id;
+    data['authorized'] = authorized;
+    data['is_file_transfer'] = isFileTransfer;
+    data['port_forward'] = portForward;
+    data['name'] = name;
+    data['peer_id'] = peerId;
+    data['keyboard'] = keyboard;
+    data['clipboard'] = clipboard;
+    data['audio'] = audio;
+    data['file'] = file;
+    data['restart'] = restart;
+    data['recording'] = recording;
+    data['block_input'] = blockInput;
+    data['disconnected'] = disconnected;
+    data['from_switch'] = fromSwitch;
+    data['in_voice_call'] = inVoiceCall;
+    data['incoming_voice_call'] = incomingVoiceCall;
     return data;
+  }
+
+  ClientType type_() {
+    if (isFileTransfer) {
+      return ClientType.file;
+    } else if (portForward.isNotEmpty) {
+      return ClientType.portForward;
+    } else {
+      return ClientType.remote;
+    }
   }
 }
 
 String getLoginDialogTag(int id) {
-  return loginDialogTag + id.toString();
+  return kLoginDialogTag + id.toString();
 }
 
-showInputWarnAlert() {
-  DialogManager.show((setState, close) => CustomAlertDialog(
-        title: Text(translate("How to get Android input permission?")),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Text(translate("android_input_permission_tip1")),
-            SizedBox(height: 10),
-            Text(translate("android_input_permission_tip2")),
-          ],
-        ),
-        actions: [
-          TextButton(child: Text(translate("Cancel")), onPressed: close),
-          ElevatedButton(
-              child: Text(translate("Open System Setting")),
-              onPressed: () {
-                FFI.serverModel.initInput();
-                close();
-              }),
+showInputWarnAlert(FFI ffi) {
+  ffi.dialogManager.show((setState, close, context) {
+    submit() {
+      AndroidPermissionManager.startAction(kActionAccessibilitySettings);
+      close();
+    }
+
+    return CustomAlertDialog(
+      title: Text(translate("How to get Android input permission?")),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(translate("android_input_permission_tip1")),
+          const SizedBox(height: 10),
+          Text(translate("android_input_permission_tip2")),
         ],
-      ));
+      ),
+      actions: [
+        dialogButton("Cancel", onPressed: close, isOutline: true),
+        dialogButton("Open System Setting", onPressed: submit),
+      ],
+      onSubmit: submit,
+      onCancel: close,
+    );
+  });
+}
+
+Future<void> showClientsMayNotBeChangedAlert(FFI? ffi) async {
+  await ffi?.dialogManager.show((setState, close, context) {
+    return CustomAlertDialog(
+      title: Text(translate("Permissions")),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(translate("android_permission_may_not_change_tip")),
+        ],
+      ),
+      actions: [
+        dialogButton("OK", onPressed: close),
+      ],
+      onSubmit: close,
+      onCancel: close,
+    );
+  });
 }

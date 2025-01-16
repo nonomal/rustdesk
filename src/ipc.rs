@@ -1,50 +1,54 @@
-use crate::rendezvous_mediator::RendezvousMediator;
+use crate::{
+    privacy_mode::PrivacyModeState,
+    ui_interface::{get_local_option, set_local_option},
+};
+use bytes::Bytes;
+use parity_tokio_ipc::{
+    Connection as Conn, ConnectionClient as ConnClient, Endpoint, Incoming, SecurityAttributes,
+};
+use serde_derive::{Deserialize, Serialize};
+use std::{
+    collections::HashMap,
+    sync::atomic::{AtomicBool, Ordering},
+};
+#[cfg(not(windows))]
+use std::{fs::File, io::prelude::*};
+
+#[cfg(all(feature = "flutter", feature = "plugin_framework"))]
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-pub use clipboard::ClipbaordFile;
+use crate::plugin::ipc::Plugin;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub use clipboard::ClipboardFile;
 use hbb_common::{
     allow_err, bail, bytes,
     bytes_codec::BytesCodec,
     config::{self, Config, Config2},
     futures::StreamExt as _,
     futures_util::sink::SinkExt,
-    log,
-    password_security::password,
-    timeout, tokio,
-    tokio::io::{AsyncRead, AsyncWrite},
+    log, password_security as password,
+    sodiumoxide::base64,
+    timeout,
+    tokio::{
+        self,
+        io::{AsyncRead, AsyncWrite},
+    },
     tokio_util::codec::Framed,
     ResultType,
 };
-use parity_tokio_ipc::{
-    Connection as Conn, ConnectionClient as ConnClient, Endpoint, Incoming, SecurityAttributes,
-};
-use serde_derive::{Deserialize, Serialize};
-use std::{collections::HashMap, sync::atomic::Ordering};
-#[cfg(not(windows))]
-use std::{fs::File, io::prelude::*};
 
-const STR_RANDOM_PASSWORD: &'static str = "random-password";
-const STR_SECURITY_PASSWORD: &'static str = "security-password";
-const STR_RANDOM_PASSWORD_UPDATE_METHOD: &'static str = "random-password-update-method";
-const STR_RANDOM_PASSWORD_ENABLED: &'static str = "random-password-enabled";
-const STR_SECURITY_PASSWORD_ENABLED: &'static str = "security-password-enabled";
-const STR_ONETIME_PASSWORD_ENABLED: &'static str = "onetime-password-enabled";
-const STR_ONETIME_PASSWORD_ACTIVATED: &'static str = "onetime-password-activated";
-const STR_RANDOM_PASSWORD_VALID: &'static str = "random-password-valid";
-pub const STR_PASSWORD_DESCRIPTION: &'static str = "password-description";
+use crate::{common::is_server, privacy_mode, rendezvous_mediator::RendezvousMediator};
 
-// State with timestamp, because std::time::Instant cannot be serialized
-#[derive(Debug, Serialize, Deserialize, Copy, Clone)]
-#[serde(tag = "t", content = "c")]
-pub enum PrivacyModeState {
-    OffSucceeded,
-    OffFailed,
-    OffByPeer,
-    OffUnknown,
-}
+// IPC actions here.
+pub const IPC_ACTION_CLOSE: &str = "close";
+pub static EXIT_RECV_CLOSE: AtomicBool = AtomicBool::new(true);
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "t", content = "c")]
 pub enum FS {
+    ReadEmptyDirs {
+        dir: String,
+        include_hidden: bool,
+    },
     ReadDir {
         dir: String,
         include_hidden: bool,
@@ -68,6 +72,9 @@ pub enum FS {
         id: i32,
         file_num: i32,
         files: Vec<(String, u64)>,
+        overwrite_detection: bool,
+        total_size: u64,
+        conn_id: i32,
     },
     CancelWrite {
         id: i32,
@@ -75,12 +82,17 @@ pub enum FS {
     WriteBlock {
         id: i32,
         file_num: i32,
-        data: Vec<u8>,
+        data: Bytes,
         compressed: bool,
     },
     WriteDone {
         id: i32,
         file_num: i32,
+    },
+    WriteError {
+        id: i32,
+        file_num: i32,
+        err: String,
     },
     WriteOffset {
         id: i32,
@@ -94,6 +106,82 @@ pub enum FS {
         last_modified: u64,
         is_upload: bool,
     },
+    Rename {
+        id: i32,
+        path: String,
+        new_name: String,
+    },
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(tag = "t")]
+pub struct ClipboardNonFile {
+    pub compress: bool,
+    pub content: bytes::Bytes,
+    pub content_len: usize,
+    pub next_raw: bool,
+    pub width: i32,
+    pub height: i32,
+    // message.proto: ClipboardFormat
+    pub format: i32,
+    pub special_name: String,
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(tag = "t", content = "c")]
+pub enum DataKeyboard {
+    Sequence(String),
+    KeyDown(enigo::Key),
+    KeyUp(enigo::Key),
+    KeyClick(enigo::Key),
+    GetKeyState(enigo::Key),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(tag = "t", content = "c")]
+pub enum DataKeyboardResponse {
+    GetKeyState(bool),
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(tag = "t", content = "c")]
+pub enum DataMouse {
+    MoveTo(i32, i32),
+    MoveRelative(i32, i32),
+    Down(enigo::MouseButton),
+    Up(enigo::MouseButton),
+    Click(enigo::MouseButton),
+    ScrollX(i32),
+    ScrollY(i32),
+    Refresh,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(tag = "t", content = "c")]
+pub enum DataControl {
+    Resolution {
+        minx: i32,
+        maxx: i32,
+        miny: i32,
+        maxy: i32,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(tag = "t", content = "c")]
+pub enum DataPortableService {
+    Ping,
+    Pong,
+    ConnCount(Option<usize>),
+    Mouse((Vec<u8>, i32)),
+    Pointer((Vec<u8>, i32)),
+    Key(Vec<u8>),
+    RequestStart,
+    WillClose,
+    CmShowElevation(bool),
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -111,6 +199,10 @@ pub enum Data {
         audio: bool,
         file: bool,
         file_transfer_enabled: bool,
+        restart: bool,
+        recording: bool,
+        block_input: bool,
+        from_switch: bool,
     },
     ChatMessage {
         text: String,
@@ -121,10 +213,13 @@ pub enum Data {
     },
     SystemInfo(Option<String>),
     ClickTime(i64),
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     MouseMoveTime(i64),
     Authorize,
     Close,
+    #[cfg(windows)]
     SAS,
+    UserSid(Option<u32>),
     OnlineStatus(Option<(i64, bool)>),
     Config((String, Option<String>)),
     Options(Option<HashMap<String, String>>),
@@ -134,13 +229,50 @@ pub enum Data {
     Socks(Option<config::Socks5Server>),
     FS(FS),
     Test,
-    SyncConfig(Option<(Config, Config2)>),
+    SyncConfig(Option<Box<(Config, Config2)>>),
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    ClipbaordFile(ClipbaordFile),
+    ClipboardFile(ClipboardFile),
     ClipboardFileEnabled(bool),
-    PrivacyModeState((i32, PrivacyModeState)),
+    #[cfg(target_os = "windows")]
+    ClipboardNonFile(Option<(String, Vec<ClipboardNonFile>)>),
+    PrivacyModeState((i32, PrivacyModeState, String)),
     TestRendezvousServer,
-    Bool((String, Option<bool>)),
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    Keyboard(DataKeyboard),
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    KeyboardResponse(DataKeyboardResponse),
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    Mouse(DataMouse),
+    Control(DataControl),
+    Theme(String),
+    Language(String),
+    Empty,
+    Disconnected,
+    DataPortableService(DataPortableService),
+    SwitchSidesRequest(String),
+    SwitchSidesBack,
+    UrlLink(String),
+    VoiceCallIncoming,
+    StartVoiceCall,
+    VoiceCallResponse(bool),
+    CloseVoiceCall(String),
+    #[cfg(all(feature = "flutter", feature = "plugin_framework"))]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    Plugin(Plugin),
+    #[cfg(windows)]
+    SyncWinCpuUsage(Option<f64>),
+    FileTransferLog((String, String)),
+    #[cfg(windows)]
+    ControlledSessionCount(usize),
+    CmErr(String),
+    CheckHwcodec,
+    #[cfg(feature = "flutter")]
+    VideoConnCount(Option<usize>),
+    // Although the key is not neccessary, it is used to avoid hardcoding the key.
+    WaylandScreencastRestoreToken((String, String)),
+    HwCodecConfig(Option<String>),
+    RemoveTrustedDevices(Vec<Bytes>),
+    ClearTrustedDevices,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -156,7 +288,7 @@ pub async fn start(postfix: &str) -> ResultType<()> {
                         loop {
                             match stream.next().await {
                                 Err(err) => {
-                                    log::trace!("ipc{} connection closed: {}", postfix, err);
+                                    log::trace!("ipc '{}' connection closed: {}", postfix, err);
                                     break;
                                 }
                                 Ok(Some(data)) => {
@@ -177,7 +309,7 @@ pub async fn start(postfix: &str) -> ResultType<()> {
 
 pub async fn new_listener(postfix: &str) -> ResultType<Incoming> {
     let path = Config::ipc_path(postfix);
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "android", target_os = "ios")))]
     check_pid(postfix).await;
     let mut endpoint = Endpoint::new(path.clone());
     match SecurityAttributes::allow_everyone_create() {
@@ -207,7 +339,7 @@ pub async fn new_listener(postfix: &str) -> ResultType<Incoming> {
     }
 }
 
-pub struct CheckIfRestart(String, Vec<String>, String);
+pub struct CheckIfRestart(String, Vec<String>, String, String);
 
 impl CheckIfRestart {
     pub fn new() -> CheckIfRestart {
@@ -215,6 +347,7 @@ impl CheckIfRestart {
             Config::get_option("stop-service"),
             Config::get_rendezvous_servers(),
             Config::get_option("audio-input"),
+            Config::get_option("voice-call-input"),
         )
     }
 }
@@ -227,6 +360,12 @@ impl Drop for CheckIfRestart {
         }
         if self.2 != Config::get_option("audio-input") {
             crate::audio_service::restart();
+        }
+        if self.3 != Config::get_option("voice-call-input") {
+            crate::audio_service::set_voice_call_input_device(
+                Some(Config::get_option("voice-call-input")),
+                true,
+            )
         }
     }
 }
@@ -246,24 +385,51 @@ async fn handle(data: Data, stream: &mut Connection) {
             let t = crate::server::CLICK_TIME.load(Ordering::SeqCst);
             allow_err!(stream.send(&Data::ClickTime(t)).await);
         }
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         Data::MouseMoveTime(_) => {
             let t = crate::server::MOUSE_MOVE_TIME.load(Ordering::SeqCst);
             allow_err!(stream.send(&Data::MouseMoveTime(t)).await);
         }
         Data::Close => {
             log::info!("Receive close message");
-            #[cfg(not(target_os = "android"))]
-            crate::server::input_service::fix_key_down_timeout_at_exit();
-            std::process::exit(0);
+            if EXIT_RECV_CLOSE.load(Ordering::SeqCst) {
+                #[cfg(not(target_os = "android"))]
+                crate::server::input_service::fix_key_down_timeout_at_exit();
+                if is_server() {
+                    let _ = privacy_mode::turn_off_privacy(0, Some(PrivacyModeState::OffByPeer));
+                }
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                if crate::is_main() {
+                    // below part is for main windows can be reopen during rustdesk installation and installing service from UI
+                    // this make new ipc server (domain socket) can be created.
+                    std::fs::remove_file(&Config::ipc_path("")).ok();
+                    #[cfg(target_os = "linux")]
+                    {
+                        hbb_common::sleep((crate::platform::SERVICE_INTERVAL * 2) as f32 / 1000.0)
+                            .await;
+                        // https://github.com/rustdesk/rustdesk/discussions/9254
+                        crate::run_me::<&str>(vec!["--no-server"]).ok();
+                    }
+                    #[cfg(target_os = "macos")]
+                    {
+                        // our launchagent interval is 1 second
+                        hbb_common::sleep(1.5).await;
+                        std::process::Command::new("open")
+                            .arg("-n")
+                            .arg(&format!("/Applications/{}.app", crate::get_app_name()))
+                            .spawn()
+                            .ok();
+                    }
+                    // leave above open a little time
+                    hbb_common::sleep(0.3).await;
+                    // in case below exit failed
+                    crate::platform::quit_gui();
+                }
+                std::process::exit(-1); // to make sure --server luauchagent process can restart because SuccessfulExit used
+            }
         }
         Data::OnlineStatus(_) => {
-            let x = config::ONLINE
-                .lock()
-                .unwrap()
-                .values()
-                .max()
-                .unwrap_or(&0)
-                .clone();
+            let x = config::get_online_state();
             let confirmed = Config::get_key_confirmed();
             allow_err!(stream.send(&Data::OnlineStatus(Some((x, confirmed)))).await);
         }
@@ -290,25 +456,25 @@ async fn handle(data: Data, stream: &mut Connection) {
                 log::info!("socks updated");
             }
         },
+        #[cfg(feature = "flutter")]
+        Data::VideoConnCount(None) => {
+            let n = crate::server::AUTHED_CONNS
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|x| x.1 == crate::server::AuthConnType::Remote)
+                .count();
+            allow_err!(stream.send(&Data::VideoConnCount(Some(n))).await);
+        }
         Data::Config((name, value)) => match value {
             None => {
                 let value;
                 if name == "id" {
                     value = Some(Config::get_id());
-                } else if name == STR_RANDOM_PASSWORD {
-                    value = Some(password::random_password());
-                } else if name == STR_SECURITY_PASSWORD {
-                    value = Some(Config::get_security_password());
-                } else if name == STR_RANDOM_PASSWORD_UPDATE_METHOD {
-                    value = Some(password::update_method().to_string());
-                } else if name == STR_PASSWORD_DESCRIPTION {
-                    value = Some(
-                        password::random_password()
-                            + &password::security_enabled().to_string()
-                            + &password::random_enabled().to_string()
-                            + &password::onetime_password_enabled().to_string()
-                            + &password::onetime_password_activated().to_string(),
-                    );
+                } else if name == "temporary-password" {
+                    value = Some(password::temporary_password());
+                } else if name == "permanent-password" {
+                    value = Some(Config::get_permanent_password());
                 } else if name == "salt" {
                     value = Some(Config::get_salt());
                 } else if name == "rendezvous_server" {
@@ -319,6 +485,24 @@ async fn handle(data: Data, stream: &mut Connection) {
                     ));
                 } else if name == "rendezvous_servers" {
                     value = Some(Config::get_rendezvous_servers().join(","));
+                } else if name == "fingerprint" {
+                    value = if Config::get_key_confirmed() {
+                        Some(crate::common::pk_to_fingerprint(Config::get_key_pair().1))
+                    } else {
+                        None
+                    };
+                } else if name == "hide_cm" {
+                    value = if crate::hbbs_http::sync::is_pro() {
+                        Some(hbb_common::password_security::hide_cm().to_string())
+                    } else {
+                        None
+                    };
+                } else if name == "voice-call-input" {
+                    value = crate::audio_service::get_voice_call_input_device();
+                } else if name == "unlock-pin" {
+                    value = Some(Config::get_unlock_pin());
+                } else if name == "trusted-devices" {
+                    value = Some(Config::get_trusted_devices_json());
                 } else {
                     value = None;
                 }
@@ -328,14 +512,16 @@ async fn handle(data: Data, stream: &mut Connection) {
                 if name == "id" {
                     Config::set_key_confirmed(false);
                     Config::set_id(&value);
-                } else if name == STR_RANDOM_PASSWORD {
-                    password::set_random_password(&value);
-                } else if name == STR_SECURITY_PASSWORD {
-                    Config::set_security_password(&value);
-                } else if name == STR_RANDOM_PASSWORD_UPDATE_METHOD {
-                    password::set_update_method(&value);
+                } else if name == "temporary-password" {
+                    password::update_temporary_password();
+                } else if name == "permanent-password" {
+                    Config::set_permanent_password(&value);
                 } else if name == "salt" {
                     Config::set_salt(&value);
+                } else if name == "voice-call-input" {
+                    crate::audio_service::set_voice_call_input_device(Some(value), true);
+                } else if name == "unlock-pin" {
+                    Config::set_unlock_pin(&value);
                 } else {
                     return;
                 }
@@ -349,6 +535,9 @@ async fn handle(data: Data, stream: &mut Connection) {
             }
             Some(value) => {
                 let _chk = CheckIfRestart::new();
+                if let Some(v) = value.get("privacy-mode-impl-key") {
+                    crate::privacy_mode::switch(v);
+                }
                 Config::set_options(value);
                 allow_err!(stream.send(&Data::Options(None)).await);
             }
@@ -357,7 +546,8 @@ async fn handle(data: Data, stream: &mut Connection) {
             let t = Config::get_nat_type();
             allow_err!(stream.send(&Data::NatType(Some(t))).await);
         }
-        Data::SyncConfig(Some((config, config2))) => {
+        Data::SyncConfig(Some(configs)) => {
+            let (config, config2) = *configs;
             let _chk = CheckIfRestart::new();
             Config::set(config);
             Config2::set(config2);
@@ -366,43 +556,111 @@ async fn handle(data: Data, stream: &mut Connection) {
         Data::SyncConfig(None) => {
             allow_err!(
                 stream
-                    .send(&Data::SyncConfig(Some((Config::get(), Config2::get()))))
+                    .send(&Data::SyncConfig(Some(
+                        (Config::get(), Config2::get()).into()
+                    )))
+                    .await
+            );
+        }
+        #[cfg(windows)]
+        Data::SyncWinCpuUsage(None) => {
+            allow_err!(
+                stream
+                    .send(&Data::SyncWinCpuUsage(
+                        hbb_common::platform::windows::cpu_uage_one_minute()
+                    ))
                     .await
             );
         }
         Data::TestRendezvousServer => {
             crate::test_rendezvous_server();
         }
-        Data::Bool((name, value)) => match value {
-            None => {
-                let value;
-                if name == STR_SECURITY_PASSWORD_ENABLED {
-                    value = Some(password::security_enabled());
-                } else if name == STR_RANDOM_PASSWORD_ENABLED {
-                    value = Some(password::random_enabled());
-                } else if name == STR_ONETIME_PASSWORD_ENABLED {
-                    value = Some(password::onetime_password_enabled());
-                } else if name == STR_ONETIME_PASSWORD_ACTIVATED {
-                    value = Some(password::onetime_password_activated());
-                } else if name == STR_RANDOM_PASSWORD_VALID {
-                    value = Some(password::random_password_valid());
-                } else {
-                    return;
+        Data::SwitchSidesRequest(id) => {
+            let uuid = uuid::Uuid::new_v4();
+            crate::server::insert_switch_sides_uuid(id, uuid.clone());
+            allow_err!(
+                stream
+                    .send(&Data::SwitchSidesRequest(uuid.to_string()))
+                    .await
+            );
+        }
+        #[cfg(all(feature = "flutter", feature = "plugin_framework"))]
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        Data::Plugin(plugin) => crate::plugin::ipc::handle_plugin(plugin, stream).await,
+        #[cfg(windows)]
+        Data::ControlledSessionCount(_) => {
+            allow_err!(
+                stream
+                    .send(&Data::ControlledSessionCount(
+                        crate::Connection::alive_conns().len()
+                    ))
+                    .await
+            );
+        }
+        #[cfg(feature = "hwcodec")]
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        Data::CheckHwcodec => {
+            scrap::hwcodec::start_check_process();
+        }
+        #[cfg(feature = "hwcodec")]
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        Data::HwCodecConfig(c) => {
+            match c {
+                None => {
+                    let v = match scrap::hwcodec::HwCodecConfig::get_set_value() {
+                        Some(v) => Some(serde_json::to_string(&v).unwrap_or_default()),
+                        None => None,
+                    };
+                    allow_err!(stream.send(&Data::HwCodecConfig(v)).await);
                 }
-                allow_err!(stream.send(&Data::Bool((name, value))).await);
-            }
-            Some(value) => {
-                if name == STR_SECURITY_PASSWORD_ENABLED {
-                    password::set_security_enabled(value);
-                } else if name == STR_RANDOM_PASSWORD_ENABLED {
-                    password::set_random_enabled(value);
-                } else if name == STR_ONETIME_PASSWORD_ENABLED {
-                    password::set_onetime_password_enabled(value);
-                } else if name == STR_ONETIME_PASSWORD_ACTIVATED {
-                    password::set_onetime_password_activated(value);
+                Some(v) => {
+                    // --server and portable
+                    scrap::hwcodec::HwCodecConfig::set(v);
                 }
             }
-        },
+        }
+        Data::WaylandScreencastRestoreToken((key, value)) => {
+            let v = if value == "get" {
+                let opt = get_local_option(key.clone());
+                #[cfg(not(target_os = "linux"))]
+                {
+                    Some(opt)
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    let v = if opt.is_empty() {
+                        if scrap::wayland::pipewire::is_rdp_session_hold() {
+                            "fake token".to_string()
+                        } else {
+                            "".to_owned()
+                        }
+                    } else {
+                        opt
+                    };
+                    Some(v)
+                }
+            } else if value == "clear" {
+                set_local_option(key.clone(), "".to_owned());
+                #[cfg(target_os = "linux")]
+                scrap::wayland::pipewire::close_session();
+                Some("".to_owned())
+            } else {
+                None
+            };
+            if let Some(v) = v {
+                allow_err!(
+                    stream
+                        .send(&Data::WaylandScreencastRestoreToken((key, v)))
+                        .await
+                );
+            }
+        }
+        Data::RemoveTrustedDevices(v) => {
+            Config::remove_trusted_devices(&v);
+        }
+        Data::ClearTrustedDevices => {
+            Config::clear_trusted_devices();
+        }
         _ => {}
     }
 }
@@ -413,6 +671,83 @@ pub async fn connect(ms_timeout: u64, postfix: &str) -> ResultType<ConnectionTmp
     Ok(ConnectionTmpl::new(client))
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::main(flavor = "current_thread")]
+pub async fn start_pa() {
+    use crate::audio_service::AUDIO_DATA_SIZE_U8;
+
+    match new_listener("_pa").await {
+        Ok(mut incoming) => {
+            loop {
+                if let Some(result) = incoming.next().await {
+                    match result {
+                        Ok(stream) => {
+                            let mut stream = Connection::new(stream);
+                            let mut device: String = "".to_owned();
+                            if let Some(Ok(Some(Data::Config((_, Some(x)))))) =
+                                stream.next_timeout2(1000).await
+                            {
+                                device = x;
+                            }
+                            if !device.is_empty() {
+                                device = crate::platform::linux::get_pa_source_name(&device);
+                            }
+                            if device.is_empty() {
+                                device = crate::platform::linux::get_pa_monitor();
+                            }
+                            if device.is_empty() {
+                                continue;
+                            }
+                            let spec = pulse::sample::Spec {
+                                format: pulse::sample::Format::F32le,
+                                channels: 2,
+                                rate: crate::platform::PA_SAMPLE_RATE,
+                            };
+                            log::info!("pa monitor: {:?}", device);
+                            // systemctl --user status pulseaudio.service
+                            let mut buf: Vec<u8> = vec![0; AUDIO_DATA_SIZE_U8];
+                            match psimple::Simple::new(
+                                None,                             // Use the default server
+                                &crate::get_app_name(),           // Our application’s name
+                                pulse::stream::Direction::Record, // We want a record stream
+                                Some(&device),                    // Use the default device
+                                "record",                         // Description of our stream
+                                &spec,                            // Our sample format
+                                None,                             // Use default channel map
+                                None, // Use default buffering attributes
+                            ) {
+                                Ok(s) => loop {
+                                    if let Ok(_) = s.read(&mut buf) {
+                                        let out =
+                                            if buf.iter().filter(|x| **x != 0).next().is_none() {
+                                                vec![]
+                                            } else {
+                                                buf.clone()
+                                            };
+                                        if let Err(err) = stream.send_raw(out.into()).await {
+                                            log::error!("Failed to send audio data:{}", err);
+                                            break;
+                                        }
+                                    }
+                                },
+                                Err(err) => {
+                                    log::error!("Could not create simple pulse: {}", err);
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            log::error!("Couldn't get pa client: {:?}", err);
+                        }
+                    }
+                }
+            }
+        }
+        Err(err) => {
+            log::error!("Failed to start pa ipc server: {}", err);
+        }
+    }
+}
+
 #[inline]
 #[cfg(not(windows))]
 fn get_pid_file(postfix: &str) -> String {
@@ -420,19 +755,19 @@ fn get_pid_file(postfix: &str) -> String {
     format!("{}.pid", path)
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "android", target_os = "ios")))]
 async fn check_pid(postfix: &str) {
     let pid_file = get_pid_file(postfix);
     if let Ok(mut file) = File::open(&pid_file) {
         let mut content = String::new();
         file.read_to_string(&mut content).ok();
-        let pid = content.parse::<i32>().unwrap_or(0);
+        let pid = content.parse::<usize>().unwrap_or(0);
         if pid > 0 {
-            use sysinfo::{ProcessExt, System, SystemExt};
+            use hbb_common::sysinfo::System;
             let mut sys = System::new();
             sys.refresh_processes();
             if let Some(p) = sys.process(pid.into()) {
-                if let Some(current) = sys.process((std::process::id() as i32).into()) {
+                if let Some(current) = sys.process((std::process::id() as usize).into()) {
                     if current.name() == p.name() {
                         // double check with connect
                         if connect(1000, postfix).await.is_ok() {
@@ -443,7 +778,10 @@ async fn check_pid(postfix: &str) {
             }
         }
     }
-    hbb_common::allow_err!(std::fs::remove_file(&Config::ipc_path(postfix)));
+    // if not remove old ipc file, the new ipc creation will fail
+    // if we remove a ipc file, but the old ipc process is still running,
+    // new connection to the ipc will connect to new ipc, old connection to old ipc still keep alive
+    std::fs::remove_file(&Config::ipc_path(postfix)).ok();
 }
 
 #[inline]
@@ -485,10 +823,6 @@ where
             .await
     }
 
-    async fn send_bool(&mut self, name: &str, value: bool) -> ResultType<()> {
-        self.send(&Data::Bool((name.to_owned(), Some(value)))).await
-    }
-
     pub async fn next_timeout(&mut self, ms_timeout: u64) -> ResultType<Option<Data>> {
         Ok(timeout(ms_timeout, self.next()).await??)
     }
@@ -518,8 +852,8 @@ where
         }
     }
 
-    pub async fn send_raw(&mut self, data: Vec<u8>) -> ResultType<()> {
-        self.inner.send(bytes::Bytes::from(data)).await?;
+    pub async fn send_raw(&mut self, data: Bytes) -> ResultType<()> {
+        self.inner.send(data).await?;
         Ok(())
     }
 
@@ -534,7 +868,7 @@ where
 }
 
 #[tokio::main(flavor = "current_thread")]
-async fn get_config(name: &str) -> ResultType<Option<String>> {
+pub async fn get_config(name: &str) -> ResultType<Option<String>> {
     get_config_async(name, 1_000).await
 }
 
@@ -556,132 +890,105 @@ pub async fn set_config_async(name: &str, value: String) -> ResultType<()> {
 }
 
 #[tokio::main(flavor = "current_thread")]
-pub async fn set_config(name: &str, value: String) -> ResultType<()> {
-    set_config_async(name, value).await
+pub async fn set_data(data: &Data) -> ResultType<()> {
+    set_data_async(data).await
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn get_bool(name: &str) -> ResultType<Option<bool>> {
-    get_bool_async(name, 1_000).await
-}
-
-async fn get_bool_async(name: &str, ms_timeout: u64) -> ResultType<Option<bool>> {
-    let mut c = connect(ms_timeout, "").await?;
-    c.send(&Data::Bool((name.to_owned(), None))).await?;
-    if let Some(Data::Bool((name2, value))) = c.next_timeout(ms_timeout).await? {
-        if name == name2 {
-            return Ok(value);
-        }
-    }
-    return Ok(None);
-}
-
-pub async fn set_bool_async(name: &str, value: bool) -> ResultType<()> {
+async fn set_data_async(data: &Data) -> ResultType<()> {
     let mut c = connect(1000, "").await?;
-    c.send_bool(name, value).await?;
+    c.send(data).await?;
     Ok(())
 }
 
 #[tokio::main(flavor = "current_thread")]
-pub async fn set_bool(name: &str, value: bool) -> ResultType<()> {
-    set_bool_async(name, value).await
+pub async fn set_config(name: &str, value: String) -> ResultType<()> {
+    set_config_async(name, value).await
 }
 
-pub fn get_random_password() -> String {
-    if let Ok(Some(password)) = get_config(STR_RANDOM_PASSWORD) {
-        password::set_random_password(&password);
-        password
+pub fn update_temporary_password() -> ResultType<()> {
+    set_config("temporary-password", "".to_owned())
+}
+
+pub fn get_permanent_password() -> String {
+    if let Ok(Some(v)) = get_config("permanent-password") {
+        Config::set_permanent_password(&v);
+        v
     } else {
-        password::random_password()
+        Config::get_permanent_password()
     }
 }
 
-pub fn set_random_password(v: String) -> ResultType<()> {
-    password::set_random_password(&v);
-    set_config(STR_RANDOM_PASSWORD, v)
+pub fn get_fingerprint() -> String {
+    get_config("fingerprint")
+        .unwrap_or_default()
+        .unwrap_or_default()
 }
 
-pub fn set_security_password(v: String) -> ResultType<()> {
-    Config::set_security_password(&v);
-    set_config(STR_SECURITY_PASSWORD, v)
+pub fn set_permanent_password(v: String) -> ResultType<()> {
+    Config::set_permanent_password(&v);
+    set_config("permanent-password", v)
 }
 
-pub fn random_password_update_method() -> String {
-    if let Ok(Some(method)) = get_config(STR_RANDOM_PASSWORD_UPDATE_METHOD) {
-        password::set_update_method(&method);
-        method
+#[cfg(feature = "flutter")]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn set_unlock_pin(v: String, translate: bool) -> ResultType<()> {
+    let v = v.trim().to_owned();
+    let min_len = 4;
+    let max_len = crate::ui_interface::max_encrypt_len();
+    let len = v.chars().count();
+    if !v.is_empty() {
+        if len < min_len {
+            let err = if translate {
+                crate::lang::translate(
+                    "Requires at least {".to_string() + &format!("{min_len}") + "} characters",
+                )
+            } else {
+                // Sometimes, translated can't show normally in command line
+                format!("Requires at least {} characters", min_len)
+            };
+            bail!(err);
+        }
+        if len > max_len {
+            bail!("No more than {max_len} characters");
+        }
+    }
+    Config::set_unlock_pin(&v);
+    set_config("unlock-pin", v)
+}
+
+#[cfg(feature = "flutter")]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn get_unlock_pin() -> String {
+    if let Ok(Some(v)) = get_config("unlock-pin") {
+        Config::set_unlock_pin(&v);
+        v
     } else {
-        password::update_method()
+        Config::get_unlock_pin()
     }
 }
 
-pub fn set_random_password_update_method(method: String) -> ResultType<()> {
-    password::set_update_method(&method);
-    set_config(STR_RANDOM_PASSWORD_UPDATE_METHOD, method)
-}
-
-pub fn is_random_password_enabled() -> bool {
-    if let Ok(Some(enabled)) = get_bool(STR_RANDOM_PASSWORD_ENABLED) {
-        password::set_random_enabled(enabled);
-        enabled
+#[cfg(feature = "flutter")]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn get_trusted_devices() -> String {
+    if let Ok(Some(v)) = get_config("trusted-devices") {
+        v
     } else {
-        password::random_enabled()
+        Config::get_trusted_devices_json()
     }
 }
 
-pub fn set_random_password_enabled(enabled: bool) -> ResultType<()> {
-    password::set_random_enabled(enabled);
-    set_bool(STR_RANDOM_PASSWORD_ENABLED, enabled)
+#[cfg(feature = "flutter")]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn remove_trusted_devices(hwids: Vec<Bytes>) {
+    Config::remove_trusted_devices(&hwids);
+    allow_err!(set_data(&Data::RemoveTrustedDevices(hwids)));
 }
 
-pub fn is_security_password_enabled() -> bool {
-    if let Ok(Some(enabled)) = get_bool(STR_SECURITY_PASSWORD_ENABLED) {
-        password::set_security_enabled(enabled);
-        enabled
-    } else {
-        password::security_enabled()
-    }
-}
-
-pub fn set_security_password_enabled(enabled: bool) -> ResultType<()> {
-    password::set_security_enabled(enabled);
-    set_bool(STR_SECURITY_PASSWORD_ENABLED, enabled)
-}
-
-pub fn is_onetime_password_enabled() -> bool {
-    if let Ok(Some(enabled)) = get_bool(STR_ONETIME_PASSWORD_ENABLED) {
-        password::set_onetime_password_enabled(enabled);
-        enabled
-    } else {
-        password::onetime_password_enabled()
-    }
-}
-
-pub fn set_onetime_password_enabled(enabled: bool) -> ResultType<()> {
-    password::set_onetime_password_enabled(enabled);
-    set_bool(STR_ONETIME_PASSWORD_ENABLED, enabled)
-}
-
-pub fn is_onetime_password_activated() -> bool {
-    if let Ok(Some(activated)) = get_bool(STR_ONETIME_PASSWORD_ACTIVATED) {
-        password::set_onetime_password_activated(activated);
-        activated
-    } else {
-        password::onetime_password_activated()
-    }
-}
-
-pub fn set_onetime_password_activated(activated: bool) -> ResultType<()> {
-    password::set_onetime_password_activated(activated);
-    set_bool(STR_ONETIME_PASSWORD_ACTIVATED, activated)
-}
-
-pub fn is_random_password_valid() -> bool {
-    if let Ok(Some(valid)) = get_bool(STR_RANDOM_PASSWORD_VALID) {
-        valid
-    } else {
-        password::random_password_valid()
-    }
+#[cfg(feature = "flutter")]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn clear_trusted_devices() {
+    Config::clear_trusted_devices();
+    allow_err!(set_data(&Data::ClearTrustedDevices));
 }
 
 pub fn get_id() -> String {
@@ -823,9 +1130,158 @@ pub async fn set_socks(value: config::Socks5Server) -> ResultType<()> {
     Ok(())
 }
 
+pub fn get_proxy_status() -> bool {
+    Config::get_socks().is_some()
+}
 #[tokio::main(flavor = "current_thread")]
 pub async fn test_rendezvous_server() -> ResultType<()> {
     let mut c = connect(1000, "").await?;
     c.send(&Data::TestRendezvousServer).await?;
     Ok(())
+}
+
+#[tokio::main(flavor = "current_thread")]
+pub async fn send_url_scheme(url: String) -> ResultType<()> {
+    connect(1_000, "_url")
+        .await?
+        .send(&Data::UrlLink(url))
+        .await?;
+    Ok(())
+}
+
+// Emit `close` events to ipc.
+pub fn close_all_instances() -> ResultType<bool> {
+    match crate::ipc::send_url_scheme(IPC_ACTION_CLOSE.to_owned()) {
+        Ok(_) => Ok(true),
+        Err(err) => Err(err),
+    }
+}
+
+#[tokio::main(flavor = "current_thread")]
+pub async fn connect_to_user_session(usid: Option<u32>) -> ResultType<()> {
+    let mut stream = crate::ipc::connect(1000, crate::POSTFIX_SERVICE).await?;
+    timeout(1000, stream.send(&crate::ipc::Data::UserSid(usid))).await??;
+    Ok(())
+}
+
+#[tokio::main(flavor = "current_thread")]
+pub async fn notify_server_to_check_hwcodec() -> ResultType<()> {
+    connect(1_000, "").await?.send(&&Data::CheckHwcodec).await?;
+    Ok(())
+}
+
+#[cfg(feature = "hwcodec")]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[tokio::main(flavor = "current_thread")]
+pub async fn get_hwcodec_config_from_server() -> ResultType<()> {
+    if !scrap::codec::enable_hwcodec_option() || scrap::hwcodec::HwCodecConfig::already_set() {
+        return Ok(());
+    }
+    let mut c = connect(50, "").await?;
+    c.send(&Data::HwCodecConfig(None)).await?;
+    if let Some(Data::HwCodecConfig(v)) = c.next_timeout(50).await? {
+        match v {
+            Some(v) => {
+                scrap::hwcodec::HwCodecConfig::set(v);
+                return Ok(());
+            }
+            None => {
+                bail!("hwcodec config is none");
+            }
+        }
+    }
+    bail!("failed to get hwcodec config");
+}
+
+#[cfg(feature = "hwcodec")]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn client_get_hwcodec_config_thread(wait_sec: u64) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    if !crate::platform::is_installed()
+        || !scrap::codec::enable_hwcodec_option()
+        || scrap::hwcodec::HwCodecConfig::already_set()
+    {
+        return;
+    }
+    ONCE.call_once(move || {
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            let mut intervals: Vec<u64> = vec![wait_sec, 3, 3, 6, 9];
+            for i in intervals.drain(..) {
+                if i > 0 {
+                    std::thread::sleep(std::time::Duration::from_secs(i));
+                }
+                if get_hwcodec_config_from_server().is_ok() {
+                    break;
+                }
+            }
+        });
+    });
+}
+
+#[cfg(feature = "hwcodec")]
+#[tokio::main(flavor = "current_thread")]
+pub async fn hwcodec_process() {
+    let s = scrap::hwcodec::check_available_hwcodec();
+    for _ in 0..5 {
+        match crate::ipc::connect(1000, "").await {
+            Ok(mut conn) => {
+                match conn
+                    .send(&crate::ipc::Data::HwCodecConfig(Some(s.clone())))
+                    .await
+                {
+                    Ok(()) => {
+                        log::info!("send ok");
+                        break;
+                    }
+                    Err(e) => {
+                        log::error!("send failed: {e:?}");
+                    }
+                }
+            }
+            Err(e) => {
+                log::error!("connect failed: {e:?}");
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
+#[tokio::main(flavor = "current_thread")]
+pub async fn get_wayland_screencast_restore_token(key: String) -> ResultType<String> {
+    let v = handle_wayland_screencast_restore_token(key, "get".to_owned()).await?;
+    Ok(v.unwrap_or_default())
+}
+
+#[tokio::main(flavor = "current_thread")]
+pub async fn clear_wayland_screencast_restore_token(key: String) -> ResultType<bool> {
+    if let Some(v) = handle_wayland_screencast_restore_token(key, "clear".to_owned()).await? {
+        return Ok(v.is_empty());
+    }
+    return Ok(false);
+}
+
+async fn handle_wayland_screencast_restore_token(
+    key: String,
+    value: String,
+) -> ResultType<Option<String>> {
+    let ms_timeout = 1_000;
+    let mut c = connect(ms_timeout, "").await?;
+    c.send(&Data::WaylandScreencastRestoreToken((key, value)))
+        .await?;
+    if let Some(Data::WaylandScreencastRestoreToken((_key, v))) = c.next_timeout(ms_timeout).await?
+    {
+        return Ok(Some(v));
+    }
+    return Ok(None);
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    #[test]
+    fn verify_ffi_enum_data_size() {
+        println!("{}", std::mem::size_of::<Data>());
+        assert!(std::mem::size_of::<Data>() < 96);
+    }
 }

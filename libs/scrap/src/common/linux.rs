@@ -1,8 +1,12 @@
-use crate::common::{
-    wayland,
-    x11::{self, Frame},
+use crate::{
+    common::{
+        wayland,
+        x11::{self},
+        TraitCapturer,
+    },
+    Frame,
 };
-use std::io;
+use std::{io, time::Duration};
 
 pub enum Capturer {
     X11(x11::Capturer),
@@ -10,10 +14,10 @@ pub enum Capturer {
 }
 
 impl Capturer {
-    pub fn new(display: Display, yuv: bool) -> io::Result<Capturer> {
+    pub fn new(display: Display) -> io::Result<Capturer> {
         Ok(match display {
-            Display::X11(d) => Capturer::X11(x11::Capturer::new(d, yuv)?),
-            Display::WAYLAND(d) => Capturer::WAYLAND(wayland::Capturer::new(d, yuv)?),
+            Display::X11(d) => Capturer::X11(x11::Capturer::new(d)?),
+            Display::WAYLAND(d) => Capturer::WAYLAND(wayland::Capturer::new(d)?),
         })
     }
 
@@ -30,11 +34,13 @@ impl Capturer {
             Capturer::WAYLAND(d) => d.height(),
         }
     }
+}
 
-    pub fn frame<'a>(&'a mut self, timeout_ms: u32) -> io::Result<Frame<'a>> {
+impl TraitCapturer for Capturer {
+    fn frame<'a>(&'a mut self, timeout: Duration) -> io::Result<Frame<'a>> {
         match self {
-            Capturer::X11(d) => d.frame(timeout_ms),
-            Capturer::WAYLAND(d) => d.frame(timeout_ms),
+            Capturer::X11(d) => d.frame(timeout),
+            Capturer::WAYLAND(d) => d.frame(timeout),
         }
     }
 }
@@ -44,31 +50,26 @@ pub enum Display {
     WAYLAND(wayland::Display),
 }
 
-#[inline]
-fn is_wayland() -> bool {
-    std::env::var("IS_WAYLAND").is_ok()
-        || std::env::var("XDG_SESSION_TYPE") == Ok("wayland".to_owned())
-}
-
 impl Display {
     pub fn primary() -> io::Result<Display> {
-        Ok(if is_wayland() {
-            Display::WAYLAND(wayland::Display::primary()?)
-        } else {
+        Ok(if super::is_x11() {
             Display::X11(x11::Display::primary()?)
+        } else {
+            Display::WAYLAND(wayland::Display::primary()?)
         })
     }
 
+    // Currently, wayland need to call wayland::clear() before call Display::all()
     pub fn all() -> io::Result<Vec<Display>> {
-        Ok(if is_wayland() {
-            wayland::Display::all()?
-                .drain(..)
-                .map(|x| Display::WAYLAND(x))
-                .collect()
-        } else {
+        Ok(if super::is_x11() {
             x11::Display::all()?
                 .drain(..)
                 .map(|x| Display::X11(x))
+                .collect()
+        } else {
+            wayland::Display::all()?
+                .drain(..)
+                .map(|x| Display::WAYLAND(x))
                 .collect()
         })
     }
